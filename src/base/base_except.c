@@ -1,8 +1,6 @@
 #include <stdlib.h>
 #include <stdio.h>
-#include "core/structures/control/assert.h"
-#include "core/structures/control/except.h"
-#define T Except_T
+#include "base.h"
 
 Except_Frame *Except_stack = NULL;
 
@@ -11,11 +9,12 @@ void Except_raise_msg(const char *file, int line, const char *msg) {
     Except_raise(&e, file, line);
 }
 
-void Except_raise(const T *e, const char *file, int line) {
+void Except_raise(const Except_T *e, const char *file, int line) {
     Except_Frame *p = Except_stack;
     assert(e);
 
     if (p == NULL) {
+        fflush(stdout);
 
         // announce an uncaught exception
         fprintf(stderr, "Uncaught exception");

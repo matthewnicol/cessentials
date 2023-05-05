@@ -1,7 +1,9 @@
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "core/structures/control/mem.h"
-#include "core/structures/control/assert.h"
+#include "base.h"
+
+#if !PRODUCTION
 
 // Checking types
 union align {
@@ -16,7 +18,7 @@ union align {
 };
 
 // Checking Macros
-#define hash(p, t) (((unsigned long)(p)>>3) & \
+#define hash(p, t) (((size_t)(p)>>3) & \
 (sizeof (t)/sizeof ((t)[0])-1))
 
 #define NDESCRIPTORS 512
@@ -39,6 +41,27 @@ static struct descriptor {
 
 static struct descriptor freelist = { &freelist };
 
+#if MEMTRACE
+static FILE *memLog;
+
+void initMem()
+{
+    fopen_s(&memLog, "../build/mem.log", "w");
+}
+
+void closeMem()
+{
+    fclose(memLog);
+}
+
+void logMem(char *message)
+{
+    fwrite(message, strlen(message), 1, memLog);
+    fwrite("\n", 1, 1, memLog);
+    fflush(memLog);
+}
+#endif
+
 // Checking Functions
 
 static struct descriptor *find(const void *ptr) {
@@ -50,8 +73,13 @@ static struct descriptor *find(const void *ptr) {
 
 void Mem_free(void *ptr, const char *file, int line) {
     if (ptr) {
-        struct descriptor *bp;
-        if (((unsigned long)ptr)%(sizeof (union align)) != 0
+#if MEMTRACE
+    char logline[200];
+    sprintf(logline, "FREE - %p - %s:%d\n", ptr, file, line);
+    fwrite(&logline[0], strlen(logline), 1, memLog);
+#endif
+        struct descriptor *bp = 0;
+        if (((size_t)ptr)%(sizeof (union align)) != 0
             || (bp = find(ptr)) == NULL || bp->free)
             Except_raise(&Assert_Failed, file, line);
         bp->free = freelist.free;
@@ -61,11 +89,11 @@ void Mem_free(void *ptr, const char *file, int line) {
 
 void *Mem_resize(void *ptr, long nbytes,
                  const char *file, int line) {
-    struct descriptor *bp;
+    struct descriptor *bp = NULL;
     void *newptr;
     assert(ptr);
     assert(nbytes > 0);
-    if (((unsigned long)ptr)%(sizeof (union align)) != 0
+    if (((size_t)ptr)%(sizeof (union align)) != 0
         || (bp = find(ptr)) == NULL || bp->free)
         Except_raise(&Assert_Failed, file, line);
     newptr = Mem_alloc(nbytes, file, line);
@@ -106,8 +134,8 @@ static struct descriptor *dalloc(void *ptr, long size,
 }
 
 void *Mem_alloc(long nbytes, const char *file, int line){
-    struct descriptor *bp;
-    void *ptr;
+    struct descriptor *bp = NULL;
+    void *ptr = NULL;
     assert(nbytes > 0);
     nbytes = ((nbytes + sizeof (union align) - 1)/
               (sizeof (union align)))*(sizeof (union align));
@@ -120,6 +148,11 @@ void *Mem_alloc(long nbytes, const char *file, int line){
                 unsigned h = hash(ptr, htab);
                 bp->link = htab[h];
                 htab[h] = bp;
+#if MEMTRACE
+                char logline[200];
+                sprintf(logline, "REQ. - %p - %ld - %s:%d\n", ptr, nbytes, file, line);
+                fwrite(&logline[0], strlen(logline), 1, memLog);
+#endif
                 return ptr;
             } else
             {
@@ -130,7 +163,7 @@ void *Mem_alloc(long nbytes, const char *file, int line){
             }
         }
         if (bp == &freelist) {
-            struct descriptor *newptr;
+            struct descriptor *newptr = NULL;
             if ((ptr = malloc(nbytes + NALLOC)) == NULL
                 || (newptr = dalloc(ptr, nbytes + NALLOC,
                                     __FILE__, __LINE__)) == NULL)
@@ -147,3 +180,60 @@ void *Mem_alloc(long nbytes, const char *file, int line){
     assert(0);
     return NULL;
 }
+
+# else
+// Data
+const Except_T Mem_Failed = { "Allocation Failed" };
+
+// Functions
+
+void *Mem_alloc(long nbytes, const char *file, int line){
+    void *ptr;
+    assert(nbytes > 0);
+    ptr = malloc(nbytes);
+    if (ptr == NULL)
+    {
+        if (file == NULL)
+            RAISE(Mem_Failed);
+        else
+            Except_raise(&Mem_Failed, file, line);
+    }
+    return ptr;
+}
+
+void *Mem_calloc(long count, long nbytes,
+                 const char *file, int line) {
+    void *ptr;
+    assert(count > 0);
+    assert(nbytes > 0);
+    ptr = calloc(count, nbytes);
+    if (ptr == NULL)
+    {
+        if (file == NULL)
+            RAISE(Mem_Failed);
+        else
+            Except_raise(&Mem_Failed, file, line);
+    }
+    return ptr;
+}
+
+void Mem_free(void *ptr, const char *file, int line) {
+    if (ptr)
+        free(ptr);
+}
+
+void *Mem_resize(void *ptr, long nbytes,
+                 const char *file, int line) {
+    assert(ptr);
+    assert(nbytes > 0);
+    ptr = realloc(ptr, nbytes);
+    if (ptr == NULL)
+    {
+        if (file == NULL)
+            RAISE(Mem_Failed);
+        else
+            Except_raise(&Mem_Failed, file, line);
+    }
+    return ptr;
+}
+#endif
