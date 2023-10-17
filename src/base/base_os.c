@@ -1,19 +1,9 @@
-#include <stdlib.h>
+#include <string.h>
 #include "base.h"
-
-V2_F32 OS_mousePosition = {};
-
-S32 OS_Keyboard_keyPressed[OS_KEYBOARD_KEYS_LENGTH] = {0};
-S32 OS_Keyboard_keyPressed_thisFrame[OS_KEYBOARD_KEYS_LENGTH] = {0};
-S32 OS_Keyboard_keyHeld[OS_KEYBOARD_KEYS_LENGTH] = {0};
-S32 OS_Keyboard_keyReleased[OS_KEYBOARD_KEYS_LENGTH] = {0};
-S32 OS_Keyboard_delayedRelease[OS_KEYBOARD_KEYS_LENGTH] = {0};
-void *OS_customData = 0;
-
 
 #if OS_WINDOWS
 #include <windowsx.h>
-#include <Windows.h>
+#include <windows.h>
 #include <minwindef.h>
 #include <time.h>
 #include <errhandlingapi.h>
@@ -22,12 +12,39 @@ void *OS_customData = 0;
 #include <wingdi.h>
 #include <winuser.h>
 #include <wingdi.h>
+#include <GL/gl.h>
+#include <GL/glu.h>
+#include <GL/wglext.h>
 
-#if USING_OPENGL
-#include <gl/GL.h>
-#include <gl/GLU.h>
-#include <gl/wglext.h>
+#define DEBUG_OS_KEYBOARD_KEY 0
+#define EVENTLOGGING 1
+
+#if EVENTLOGGING
+LARGE_INTEGER OS_EVENT_LOG_START_TIME;
+LARGE_INTEGER OS_EVENT_LOG_FREQUENCY;
+CHAR OS_EVENT_LOG_PHASE[50];
+FILE *OS_EVENT_LOG = 0;
+S32 OS_EVENTLOGGING = 0;
+S32 OS_EVENTLOGGING_MOUSE = 0;
+S32 OS_EVENTLOGGING_KEYBOARD = 0;
 #endif
+
+V2_F32 OS_mousePosition = {};
+V2_F32 OS_lastMousePosition = {};
+V2_F32 OS_mouseMovement = {};
+
+int OS_mousePositionChanged = 0;
+
+S32 OS_Keyboard_keyPressed[OS_KEYBOARD_KEYS_LENGTH] = {0};
+S32 OS_Keyboard_keyPressed_thisFrame[OS_KEYBOARD_KEYS_LENGTH] = {0};
+S32 OS_Keyboard_keyHeld[OS_KEYBOARD_KEYS_LENGTH] = {0};
+S32 OS_Keyboard_keyReleased[OS_KEYBOARD_KEYS_LENGTH] = {0};
+S32 OS_Keyboard_delayedRelease[OS_KEYBOARD_KEYS_LENGTH] = {0};
+
+S32 OS_Mouse_buttonState[OS_MOUSE_BUTTONS_LENGTH] = {0};
+S32 OS_Mouse_buttonState_thisFrame[OS_MOUSE_BUTTONS_LENGTH] = {0};
+
+void *OS_customData = 0;
 
 struct OS_thread {
     OS_ThreadableFunction func;
@@ -434,6 +451,14 @@ OS_keyboardKey OS_OSKeyToKeyboardKey[] = {
     [0xDF]=0,
 };
 
+const char *OS_mouseButtonNames[OS_MOUSE_BUTTONS_LENGTH] = {
+    "MOUSE_LEFT",
+    "MOUSE_MIDDLE",
+    "MOUSE_RIGHT",
+    "MOUSE_XBUTTON_1",
+    "MOUSE_XBUTTON_2",
+};
+
 const char *OS_keyboardKeyNames[OS_KEYBOARD_KEYS_LENGTH] = {
     "OS_KEYBOARD_NULL",
     "OS_KEYBOARD_SPACE",
@@ -561,11 +586,25 @@ const char *OS_keyboardKeyNames[OS_KEYBOARD_KEYS_LENGTH] = {
     "OS_KEYBOARD_OEM_102",
 };
 
+U64 HashString(const char *key) {
+    U64 hash = 5381;
+    S32 c;
+    while ((c = *key++)) {
+        hash = ((hash << 5) + hash) + c;
+    }
+    return hash;
+}
+
+U64 RollingHashString(char c, U64 hash) {
+    if (hash == 0) hash = 5381;
+    return ((hash << 5) + hash) + c;
+}
+
 char OS_Keyboard_keyToChar(OS_keyboardKey key) {
     if (key >= OS_KEYBOARD_FIRST_PRINTABLE_CHAR && key < OS_KEYBOARD_PRINTABLE_CHAR_END) {
-        if (OS_Keyboard_keyHeld[OS_KEYBOARD_SHIFT] && OS_capsLockEnabled()) {
+        if ((OS_Keyboard_keyHeld[OS_KEYBOARD_SHIFT] || OS_Keyboard_keyPressed[OS_KEYBOARD_SHIFT] ) && OS_capsLockEnabled()) {
             return OS_Keyboard_keyToShiftUppercase[key];
-        } else if (OS_Keyboard_keyHeld[OS_KEYBOARD_SHIFT]) {
+        } else if (OS_Keyboard_keyHeld[OS_KEYBOARD_SHIFT] || OS_Keyboard_keyPressed[OS_KEYBOARD_SHIFT]) {
             return OS_Keyboard_keyToShift[key];
         } else if (OS_capsLockEnabled()) {
             return OS_Keyboard_keyToUppercase[key];
@@ -582,12 +621,23 @@ struct OSLibrary {
 
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 
-int OS_FS_fileExists(char *filename) {
+const S32 *OS_getKeyboardPressed() { return OS_Keyboard_keyPressed; };
+const S32 *OS_getKeyboardHeld() { return OS_Keyboard_keyHeld; };
+const S32 *OS_getKeyboardReleased() { return OS_Keyboard_keyReleased; };
+const V2_F32 *OS_getMousePosition() { return &OS_mousePosition; }
+const V2_F32 *OS_getLastMousePosition() { return &OS_lastMousePosition; }
+const V2_F32 *OS_getMouseMovement() { return &OS_mouseMovement; }
+
+const S32 *OS_getMouseState() { return OS_Mouse_buttonState; }
+const S32 *OS_getMouseState_thisFrame() { return OS_Mouse_buttonState_thisFrame; }
+
+
+S32 OS_FS_fileExists(char *filename) {
     DWORD dwAttrib = GetFileAttributes(filename);
     return (dwAttrib != INVALID_FILE_ATTRIBUTES && !(dwAttrib & FILE_ATTRIBUTE_DIRECTORY));
 }
 
-List_t *OS_FS_Scandir(char *folder) {
+List_t *OS_FS_Scandir(const char *folder, OS_SCANDIR_FILTER filter) {
     WIN32_FIND_DATA ffd;
     DWORD err = 0;
     char ifolder[256], ofolder[256];
@@ -620,14 +670,25 @@ List_t *OS_FS_Scandir(char *folder) {
         char *filename;
         NEWN(filename, strlen(ofolder)+strlen(ffd.cFileName)+1);
         sprintf(filename, "%s%s", ofolder, ffd.cFileName);
-        files = List_append(files, filename, 0);
+        files = List_append(files, filename,  (ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? OS_DIR : OS_FILE);
     } while (FindNextFile(hFind, &ffd));
     
     FindClose(hFind);
     return files;
 }
 
-char *OS_FS_getFileContents(char *filename) {
+void OS_FS_setFileContents(const char *filename, void *data, U32 numBytes) {
+    FILE *fp;
+    errno_t err;
+    if ((err = fopen_s(&fp, filename, "wb")) != 0) {
+        printf("Could not open file: %s\n", filename);
+        exit(-1);
+    }
+    fwrite(data, numBytes, 1, fp);
+    fclose(fp);
+}
+
+char *OS_FS_getFileContents(const char *filename) {
     FILE *fp;
     errno_t err;
     if ((err = fopen_s(&fp, filename, "rb")) != 0) {
@@ -643,6 +704,15 @@ char *OS_FS_getFileContents(char *filename) {
     buffer[fsize] = '\0';
     fclose(fp);
     return buffer;
+}
+
+void OS_FS_structLoad(const char *filename, void *dest, U32 numBytes) {
+    char *dat = OS_FS_getFileContents(filename);
+    memcpy(dest, dat, numBytes);
+}
+
+void OS_FS_structSave(const char *filename, void *src, U32 numBytes) {
+    OS_FS_setFileContents(filename, src, numBytes);
 }
 
 U64 OS_currentTime() {
@@ -763,51 +833,6 @@ U32 OS_Window_screenHeight(OS_Window window) {
     return window->height;
 }
 
-void OS_handleEvents() {
-    OS_Window_handleEvents(OS_activeWindow);
-}
-
-void OS_triggerKeyUp(OS_Window window, OS_keyboardKey key) {
-    OS_Keyboard_keyPressed[key] = 0;
-    OS_Keyboard_keyHeld[key] = 0;
-    OS_Keyboard_keyReleased[key] = 1;
-    if (OS_activeWindow->keyPressFunc) {
-        OS_activeWindow->keyPressFunc(OS_customData, key, 0);
-    }
-}
-
-void OS_triggerMouseMove(OS_Window window, int mouseX, int mouseY) {
-    OS_mousePosition.x = -1.0 + (float)mouseX / window->width * 2.0;
-    OS_mousePosition.y = 1.0 - (float)mouseY / window->height * 2.0;
-    if (window->mouseMoveFunc) {
-        window->mouseMoveFunc(OS_customData, &OS_mousePosition);
-    }
-}
-
-void OS_Window_handleEvents(OS_Window window) {
-    MSG message;
-    // Initialise all "last frame" presses to 0
-    // Create events for all delayed key releases
-    for (int i = 0; i < OS_KEYBOARD_KEYS_LENGTH; i++) {
-        OS_Keyboard_keyPressed_thisFrame[i] = 0;
-        OS_Keyboard_keyReleased[i] = 0;
-        if (OS_Keyboard_delayedRelease[i]) {
-            OS_triggerKeyUp(window, i);
-            OS_Keyboard_delayedRelease[i] = 0;
-        }
-    }
-    while (PeekMessage(&message, 0, 0, 0, PM_REMOVE)) {
-        if (message.message == WM_QUIT) {
-            window->quitRequested = 1;
-            break;
-        }
-        else {
-            // TranslateMessage(&message);
-            DispatchMessage(&message);
-        }
-    }
-}
-
 void OS_Window_swapBuffers(OS_Window window) {
     SwapBuffers(window->hDC);
 }
@@ -839,8 +864,6 @@ void OS_Window_connect(
     *keyHeldRef = OS_Keyboard_keyHeld;
     *keyReleasedRef = OS_Keyboard_keyReleased;
 }
-
-#if USING_OPENGL
 
 void *GetAnyGLFuncAddress(const char *name)
 {
@@ -970,6 +993,7 @@ HGLRC init_opengl(HDC real_dc) {
         WGL_COLOR_BITS_ARB,         32,
         WGL_DEPTH_BITS_ARB,         24,
         WGL_STENCIL_BITS_ARB,       8,
+        
         0
     };
 
@@ -1033,16 +1057,19 @@ static HWND create_window(HINSTANCE inst) {
         .top = 0,
         .left = 0
     };
-    DWORD window_style = WS_OVERLAPPEDWINDOW;
+    // DWORD window_style = WS_OVERLAPPEDWINDOW;
+    DWORD window_style = WS_POPUP | WS_CLIPSIBLINGS | WS_CLIPCHILDREN;
+    DWORD window_extended_style = WS_EX_TOPMOST;
+    // DWORD window_extended_style = WS_EX_OVERLAPPEDWINDOW;
     AdjustWindowRect(&rect, window_style, 0);
 
     HWND window = CreateWindowExA(
-        0,
+        window_extended_style,
         window_class.lpszClassName,
         "OpenGL",
         window_style,
-        CW_USEDEFAULT,
-        CW_USEDEFAULT,
+        0,
+        0,
         rect.right - rect.left,
         rect.bottom - rect.top,
         0,
@@ -1055,21 +1082,57 @@ static HWND create_window(HINSTANCE inst) {
         exit(-1);
     }
 
+    DEVMODE fullscreenSettings;
+    int isChangeSuccessful;
+    // RECT windowBoundary;
+
+    EnumDisplaySettings(NULL, 0, &fullscreenSettings);
+    fullscreenSettings.dmPelsWidth        = 1920;
+    fullscreenSettings.dmPelsHeight       = 1080;
+    fullscreenSettings.dmBitsPerPel       = 32;
+    fullscreenSettings.dmDisplayFrequency = 60;
+    fullscreenSettings.dmFields           = DM_PELSWIDTH |
+                                            DM_PELSHEIGHT |
+                                            DM_BITSPERPEL |
+                                            DM_DISPLAYFREQUENCY;
+
+    SetWindowLongPtr(window, GWL_EXSTYLE, WS_EX_APPWINDOW | WS_EX_TOPMOST);
+    SetWindowLongPtr(window, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+    SetWindowPos(window, HWND_TOPMOST, 0, 0, 1920, 1080, SWP_SHOWWINDOW);
+    isChangeSuccessful = ChangeDisplaySettings(&fullscreenSettings, CDS_FULLSCREEN) == DISP_CHANGE_SUCCESSFUL;
+    ShowWindow(window, SW_MAXIMIZE);
+    SetForegroundWindow(window);
+    SetFocus(window);
+
+
+    // Test
+    SetCapture(window);
+
+    // Capture cursor
+    RECT clipRect;
+    GetClientRect(window, &clipRect);
+    ClientToScreen(window, (POINT*) &clipRect.left);
+    ClientToScreen(window, (POINT*) &clipRect.right);
+    ClipCursor(&clipRect);
+
+
     return window;
 }
 
 void OS_Window_toFullScreen() {
  DEVMODE fullscreenSettings;
     int isChangeSuccessful;
-    RECT windowBoundary;
+    // RECT windowBoundary;
 
     EnumDisplaySettings(NULL, 0, &fullscreenSettings);
     fullscreenSettings.dmPelsWidth        = 1920;
     fullscreenSettings.dmPelsHeight       = 1080;
     fullscreenSettings.dmBitsPerPel       = 32;
+    fullscreenSettings.dmDisplayFrequency = 60;
     fullscreenSettings.dmFields           = DM_PELSWIDTH |
                                             DM_PELSHEIGHT |
-                                            DM_BITSPERPEL;
+                                            DM_BITSPERPEL |
+                                            DM_DISPLAYFREQUENCY;
 
     SetWindowLongPtr(OS_activeWindow->hwnd, GWL_EXSTYLE, WS_EX_APPWINDOW | WS_EX_TOPMOST);
     SetWindowLongPtr(OS_activeWindow->hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
@@ -1082,7 +1145,8 @@ OS_Window OS_OpenGLWindow(U32 width, U32 height, U32 bitsPerPixel, U32 isFullScr
     HINSTANCE hInstance = GetModuleHandle(0);
     HWND window = create_window(hInstance);
     HDC gldc = GetDC(window);
-    HGLRC glrc = init_opengl(gldc);
+    // HGLRC glrc = init_opengl(gldc);
+    init_opengl(gldc);
     
     OS_Window w;
     NEW(w);
@@ -1095,9 +1159,10 @@ OS_Window OS_OpenGLWindow(U32 width, U32 height, U32 bitsPerPixel, U32 isFullScr
     w->hDC = gldc;
     OS_activeWindow = w;
     
-    OS_Window_toFullScreen();
     ShowWindow(window, 1);
     UpdateWindow(window);
+    OS_Window_changeCursor(OS_CURSOR_CROSSHAIR);
+    // OS_Window_toFullScreen();
     // SetForegroundWindow(w->hwnd);
     // SetFocus(w->hwnd);
     
@@ -1111,7 +1176,69 @@ OS_Window OS_OpenGLWindow(U32 width, U32 height, U32 bitsPerPixel, U32 isFullScr
     return w;
 }
 
-#endif
+void OS_handleEvents() {
+    OS_Window_handleEvents(OS_activeWindow);
+}
+
+void OS_triggerKeyUp(OS_Window window, OS_keyboardKey key) {
+    OS_Keyboard_keyPressed[key] = 0;
+    OS_Keyboard_keyHeld[key] = 0;
+    OS_Keyboard_keyReleased[key] = 1;
+    if (OS_activeWindow->keyPressFunc) {
+        OS_activeWindow->keyPressFunc(OS_customData, key, 0);
+    }
+}
+
+void OS_triggerMouseMove(OS_Window window, int mouseX, int mouseY) {
+    OS_mousePosition.x = -1.0 + (float)mouseX / window->width * 2.0;
+    OS_mousePosition.y = 1.0 - (float)mouseY / window->height * 2.0;
+    if (window->mouseMoveFunc) {
+        window->mouseMoveFunc(OS_customData, &OS_mousePosition);
+    }
+}
+
+void OS_Window_handleEvents(OS_Window window) {
+    MSG message;
+
+    // Mouse state sanitation:
+    //  - Reset mouse release so that we only process it on one frame.
+    //  - Clear all "this frame" mouse state.
+    for (S32 i = 0; i < OS_MOUSE_BUTTONS_LENGTH; i++) {
+        OS_Mouse_buttonState_thisFrame[i] = 0;
+        if (OS_Mouse_buttonState[i] == MOUSE_RELEASE) {
+            OS_Mouse_buttonState[i] = MOUSE_IDLE;
+        }
+    }
+    // Initialise all "last frame" presses to 0
+    // Create events for all delayed key releases
+    for (int i = 0; i < OS_KEYBOARD_KEYS_LENGTH; i++) {
+        OS_Keyboard_keyPressed_thisFrame[i] = 0;
+        OS_Keyboard_keyReleased[i] = 0;
+        if (OS_Keyboard_delayedRelease[i]) {
+            OS_triggerKeyUp(window, i);
+            OS_Keyboard_delayedRelease[i] = 0;
+        }
+    }
+    OS_mouseMovement.x = 0;
+    OS_mouseMovement.y = 0;
+    while (PeekMessage(&message, 0, 0, 0, PM_REMOVE)) {
+        if (message.message == WM_QUIT) {
+            window->quitRequested = 1;
+            break;
+        }
+        else {
+            // TranslateMessage(&message);
+            DispatchMessage(&message);
+        }
+    }
+    if (window->mouseMoveFunc && OS_mousePositionChanged) {
+        window->mouseMoveFunc(OS_customData, &OS_mousePosition);
+    }
+    OS_mousePositionChanged = 0;
+}
+
+#define TMP_HANDLE_EVT(E) case E: printf("%s (%d)\n", #E, E); break
+#define TMP_HANDLE_EVT_R(E) case E: printf("%s (%d)\n", #E, E); return 0
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
     switch (message) {
@@ -1119,59 +1246,165 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) 
         // WINDOW LIFECYCLE
         case WM_CLOSE: { DestroyWindow(hwnd); } break;
         case WM_DESTROY: { PostQuitMessage(0); } break;
-        case WM_KILLFOCUS: { printf("WM_KILLFOCUS\n"); } break;
-        case WM_SETFOCUS: { printf("WM_SETFOCUS\n"); } break;
-        case WM_ACTIVATE: { printf("WM_ACTIVATE\n"); }  break;
-        case WM_NCHITTEST: { printf("WM_NCHITEST\n"); } break;
-        case WM_NCACTIVATE: { printf("WM_NCACTIVATE\n"); } break;
-        case WM_ACTIVATEAPP: { printf("WM_ACTIVATEAPP\n"); } break;
-        case WM_IME_SETCONTEXT: { printf("WM_IME_SETCONTEXT\n"); } break;
-        case WM_IME_NOTIFY: { printf("WM_IME_NOTIFY\n"); } break;
-
-        // MOUSE ICON/CURSOR
-        case WM_GETICON: { printf("WM_GETICON\n"); } break;
-        case WM_SETCURSOR: { printf("WM_SETCURSOR\n"); } break;
-
-        // WINDOW
-        case WM_WINDOWPOSCHANGING: { printf("WM_WINDOWPOSCHANGING\n"); } break;
-        case WM_WINDOWPOSCHANGED: { printf("WM_WINDOWPOSCHANGED\n"); } break;
-        case WM_SIZE: { printf("WM_SIZE\n"); } break;
-        case WM_PAINT: { printf("WM_PAINT\n"); } break;
+        TMP_HANDLE_EVT(WM_KILLFOCUS);
+        TMP_HANDLE_EVT(WM_SETFOCUS);
+        TMP_HANDLE_EVT(WM_ACTIVATE);
+        TMP_HANDLE_EVT(WM_NCHITTEST);
+    
+        TMP_HANDLE_EVT(WM_NCACTIVATE);
+        TMP_HANDLE_EVT(WM_ACTIVATEAPP);
+        TMP_HANDLE_EVT(WM_IME_SETCONTEXT);
+        TMP_HANDLE_EVT(WM_IME_NOTIFY);
         
+        // MOUSE ICON CURSOR
+        TMP_HANDLE_EVT(WM_GETICON);
+        TMP_HANDLE_EVT(WM_SETCURSOR);
+        TMP_HANDLE_EVT(WM_NCMOUSEMOVE);
+        TMP_HANDLE_EVT(WM_NCMOUSELEAVE);
+    
+        TMP_HANDLE_EVT(WM_WINDOWPOSCHANGING);
+        TMP_HANDLE_EVT(WM_WINDOWPOSCHANGED);
+        TMP_HANDLE_EVT(WM_SIZE);
+        TMP_HANDLE_EVT(WM_PAINT);
+        
+
         // MOUSE
+        // S32 OS_Mouse_buttonClicked[OS_MOUSE_BUTTONS_LENGTH] = {0};
+        // S32 OS_Mouse_buttonHeld[OS_MOUSE_BUTTONS_LENGTH] = {0};
+        // S32 OS_Mouse_buttonReleased[OS_MOUSE_BUTTONS_LENGTH] = {0};
+        // S32 OS_Mouse_buttonClicked_thisFrame[OS_MOUSE_BUTTONS_LENGTH] = {0};
+        case WM_LBUTTONDOWN: { // 513
+            OS_Mouse_buttonState[OS_MOUSE_LEFT]++;
+            if (OS_Mouse_buttonState[OS_MOUSE_LEFT] > MOUSE_HOLD) {
+                OS_Mouse_buttonState[OS_MOUSE_LEFT] = MOUSE_HOLD;
+            }
+            OS_Mouse_buttonState_thisFrame[OS_MOUSE_LEFT] = OS_Mouse_buttonState[OS_MOUSE_LEFT];
+
+            if (OS_activeWindow->mouseClickFunc) {
+                OS_activeWindow->mouseClickFunc(OS_customData, OS_MOUSE_LEFT, OS_Mouse_buttonState[OS_MOUSE_LEFT], 0, &OS_mousePosition);
+            }
+        } break;
+        case WM_LBUTTONUP: { // 514
+            OS_Mouse_buttonState[OS_MOUSE_LEFT] = OS_Mouse_buttonState_thisFrame[OS_MOUSE_LEFT] = MOUSE_RELEASE;
+            if (OS_activeWindow->mouseClickFunc) {
+                OS_activeWindow->mouseClickFunc(OS_customData, OS_MOUSE_LEFT, OS_Mouse_buttonState[OS_MOUSE_LEFT], 0, &OS_mousePosition);
+            }
+        } break;
+        case WM_RBUTTONDOWN: {
+            OS_Mouse_buttonState[OS_MOUSE_RIGHT]++;
+            if (OS_Mouse_buttonState[OS_MOUSE_RIGHT] > MOUSE_HOLD) {
+                OS_Mouse_buttonState[OS_MOUSE_RIGHT] = MOUSE_HOLD;
+            }
+            OS_Mouse_buttonState_thisFrame[OS_MOUSE_RIGHT] = OS_Mouse_buttonState[OS_MOUSE_RIGHT];
+
+            if (OS_activeWindow->mouseClickFunc) {
+                OS_activeWindow->mouseClickFunc(OS_customData, OS_MOUSE_RIGHT, OS_Mouse_buttonState[OS_MOUSE_RIGHT], 0, &OS_mousePosition);
+            }
+
+        } break;
+        case WM_RBUTTONUP: {
+            OS_Mouse_buttonState[OS_MOUSE_RIGHT] = OS_Mouse_buttonState_thisFrame[OS_MOUSE_RIGHT] = MOUSE_RELEASE;
+            if (OS_activeWindow->mouseClickFunc) {
+                OS_activeWindow->mouseClickFunc(OS_customData, OS_MOUSE_RIGHT, OS_Mouse_buttonState[OS_MOUSE_RIGHT], 0, &OS_mousePosition);
+            }
+        } break;
+        case WM_MBUTTONDOWN: {
+            if (++OS_Mouse_buttonState[OS_MOUSE_MIDDLE] > MOUSE_HOLD) {
+                OS_Mouse_buttonState[OS_MOUSE_MIDDLE] = MOUSE_HOLD;
+            }
+            OS_Mouse_buttonState_thisFrame[OS_MOUSE_MIDDLE] = OS_Mouse_buttonState[OS_MOUSE_MIDDLE];
+
+            if (OS_activeWindow->mouseClickFunc) {
+                OS_activeWindow->mouseClickFunc(OS_customData, OS_MOUSE_MIDDLE, OS_Mouse_buttonState[OS_MOUSE_MIDDLE], 0, &OS_mousePosition);
+            }
+        } break;
+        case WM_MBUTTONUP: {
+            OS_Mouse_buttonState[OS_MOUSE_MIDDLE] = OS_Mouse_buttonState_thisFrame[OS_MOUSE_MIDDLE] = MOUSE_RELEASE;
+            if (OS_activeWindow->mouseClickFunc) {
+                OS_activeWindow->mouseClickFunc(OS_customData, OS_MOUSE_MIDDLE, OS_Mouse_buttonState[OS_MOUSE_MIDDLE], 0, &OS_mousePosition);
+            }
+        } break;
+        case WM_XBUTTONDOWN: {
+            if (++OS_Mouse_buttonState[OS_MOUSE_XBUTTON1 - 1 + GET_XBUTTON_WPARAM(wparam)] > MOUSE_HOLD) {
+                OS_Mouse_buttonState[OS_MOUSE_XBUTTON1 - 1 + GET_XBUTTON_WPARAM(wparam)] = MOUSE_HOLD;
+            }
+            OS_Mouse_buttonState_thisFrame[OS_MOUSE_XBUTTON1 - 1 + GET_XBUTTON_WPARAM(wparam)] = OS_Mouse_buttonState[OS_MOUSE_XBUTTON1 - 1 + GET_XBUTTON_WPARAM(wparam)];
+
+            if (OS_activeWindow->mouseClickFunc) {
+                OS_activeWindow->mouseClickFunc(OS_customData, OS_MOUSE_XBUTTON1 - 1 + GET_XBUTTON_WPARAM(wparam), OS_Mouse_buttonState[OS_MOUSE_XBUTTON1 - 1 + GET_XBUTTON_WPARAM(wparam)], 0, &OS_mousePosition);
+            }
+        } break;
+        case WM_XBUTTONUP: {
+            OS_Mouse_buttonState[OS_MOUSE_XBUTTON1 - 1 + GET_XBUTTON_WPARAM(wparam)] = OS_Mouse_buttonState_thisFrame[OS_MOUSE_XBUTTON1 - 1 + GET_XBUTTON_WPARAM(wparam)] = MOUSE_RELEASE;
+            if (OS_activeWindow->mouseClickFunc) {
+                OS_activeWindow->mouseClickFunc(OS_customData, OS_MOUSE_XBUTTON1 - 1 + GET_XBUTTON_WPARAM(wparam), OS_Mouse_buttonState[OS_MOUSE_XBUTTON1 - 1 + GET_XBUTTON_WPARAM(wparam)], 0, &OS_mousePosition);
+            }
+        } break;
+        
+
         case WM_MOUSEWHEEL: { // 522
             if (OS_activeWindow->mouseScrollFunc) {
                 OS_activeWindow->mouseScrollFunc(OS_customData, 0, 0);
             }
         } break;
         case WM_CONTEXTMENU: { //123 (right click?)
-            if (OS_activeWindow->mouseClickFunc) {
-                OS_activeWindow->mouseClickFunc(OS_customData, 0, 0, 0, 0);
-            }
+            // if (OS_activeWindow->mouseClickFunc) {
+                // OS_activeWindow->mouseClickFunc(OS_customData, OS_MOUSE_RIGHT_BUTTON, OS_MOUSE, 0, 0);
+            // }
         }
-        case WM_MOUSEACTIVATE: { //33
-            printf("WM_MOUSEACTIVATE\n");
-        } break;
-        case WM_MOUSEMOVE:
-            printf("WM_MOUSEMOVE\n");
+    //     case WM_MOUSEACTIVATE: { //33
+    //         printf("WM_MOUSEACTIVATE\n");
+    //     } break;
+        case WM_MOUSEMOVE: {
+            // printf("WM_MOUSEMOVE\n");
             int mouseX = GET_X_LPARAM(lparam);
             int mouseY = GET_Y_LPARAM(lparam);
-            OS_triggerMouseMove(OS_activeWindow, mouseX, mouseY);
-            break;
-        case WM_LBUTTONDOWN: { printf("WM_LBUTTONDOWN\n"); } break;
-        case WM_LBUTTONUP: { printf("WM_LBUTTONUP\n"); } break;
-        case WM_RBUTTONDOWN: { printf("WM_RBUTTONDOWN\n"); } break;
-        case WM_RBUTTONUP: { printf("WM_RBUTTONUP\n"); } break;
-        case WM_MBUTTONDOWN: { printf("WM_MBUTTONDOWN\n"); } break;
-        case WM_MBUTTONUP: { printf("WM_MBUTTONUP\n"); } break;
+            // printf("%d %d\n", mouseX, mouseY);
+            
+            
+
+
+            OS_lastMousePosition.x = OS_mousePosition.x;
+            OS_lastMousePosition.y = OS_mousePosition.y;
+            OS_mousePosition.x = -1.0 + (float)mouseX / OS_activeWindow->width * 2.0;
+            OS_mousePosition.y = 1.0 - (float)mouseY / OS_activeWindow->height * 2.0;
+            OS_mouseMovement.x = OS_mousePosition.x - OS_lastMousePosition.x;
+            OS_mouseMovement.y = OS_lastMousePosition.y - OS_mousePosition.y;
+            OS_mousePositionChanged = 1;
+            return 0;
+        } break;
 	
-    // KEYBOARD HANDLING EVENTS
-    case WM_KEYDOWN: {
+        // // KEYBOARD HANDLING EVENTS
+        case WM_KEYDOWN: {
             if (OS_OSKeyToKeyboardKey[wparam]) {
                 OS_keyboardKey key = OS_OSKeyToKeyboardKey[wparam];
                 if (!OS_Keyboard_keyPressed_thisFrame[key]) {
+                    #if DEBUG_OS_KEYBOARD_KEY == 1
+                    if (!OS_Keyboard_keyHeld[key] && !OS_Keyboard_keyPressed[key]) {
+                        printf("Key Press: %s\n", OS_keyboardKeyNames[key]);
+                    }
+                    #endif
+                    #if EVENTLOGGING == 1
+                    if (!OS_Keyboard_keyHeld[key] && !OS_Keyboard_keyPressed[key]) {
+                        char event[256];
+                        sprintf(event, "PRESS %s", OS_keyboardKeyNames[key]);
+                        OS_logEvent("BASE_OS", "KEYBOARD", event);
+                    }
+                    #endif
                     OS_Keyboard_keyHeld[key] = OS_Keyboard_keyPressed[key] || OS_Keyboard_keyHeld[key];
                     OS_Keyboard_keyPressed[key] = !OS_Keyboard_keyHeld[key];
+                    #if DEBUG_OS_KEYBOARD_KEY == 1
+                    if (!OS_Keyboard_keyHeld[key]) {
+                        printf("Key Hold: %s\n", OS_keyboardKeyNames[key]);
+                    }
+                    #endif
+                    #if EVENTLOGGING == 1
+                    if (!OS_Keyboard_keyHeld[key]) {
+                        char event[256];
+                        sprintf(event, "HOLD %s", OS_keyboardKeyNames[key]);
+                        OS_logEvent("BASE_OS", "KEYBOARD", event);
+                    }
+                    #endif
                 }
                 OS_Keyboard_keyPressed_thisFrame[key] = 1;
                 if (OS_activeWindow->keyPressFunc) {
@@ -1179,37 +1412,249 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) 
                 }
             }
         } break;
-	case WM_KEYUP: {
-        if (OS_OSKeyToKeyboardKey[wparam]) {
-            OS_keyboardKey key = OS_OSKeyToKeyboardKey[wparam];
-            // Key press and release would both be triggered this frame. Instead, push
-            // the release to next frame
-            if (OS_Keyboard_keyPressed_thisFrame[key]) {
-                OS_Keyboard_delayedRelease[key] = 1;
-            } else {
-                OS_triggerKeyUp(OS_activeWindow, key);
-            }   
-        }
-        
-    } break;
-    default:
-        printf("Unhandled Message: %u\n", message);
-        break;
-	}
+        case WM_KEYUP: {
+            if (OS_OSKeyToKeyboardKey[wparam]) {
+                OS_keyboardKey key = OS_OSKeyToKeyboardKey[wparam];
+                // Key press and release would both be triggered this frame. Instead, push
+                // the release to next frame
+                if (OS_Keyboard_keyPressed_thisFrame[key]) {
+                    OS_Keyboard_delayedRelease[key] = 1;
+                } else {
+                    #if DEBUG_OS_KEYBOARD_KEY == 1
+                    printf("Key Release: %s\n", OS_keyboardKeyNames[key]);
+                    #endif
+                    #if EVENTLOGGING == 1
+                    char event[256];
+                    sprintf(event, "RELEASE %s", OS_keyboardKeyNames[key]);
+                    OS_logEvent("BASE_OS", "KEYBOARD", event);
+                    #endif
+                    OS_Keyboard_keyPressed[key] = 0;
+                    OS_Keyboard_keyHeld[key] = 0;
+                    OS_Keyboard_keyReleased[key] = 1;
+                    if (OS_activeWindow->keyPressFunc) {
+                        OS_activeWindow->keyPressFunc(OS_customData, key, 0);
+                    }
+                    // OS_triggerKeyUp(OS_activeWindow, key);
+                }   
+            }
+        } break;
+        default:
+            printf("Unhandled Message: %u\n", message);
+            break;
+    }
 	return DefWindowProc(hwnd, message, wparam, lparam);
 }
 
+void OS_Window_changeCursor(OS_CursorType cursorType) {
+    switch (cursorType) {
+        case OS_CURSOR_ARROW: {
+            HCURSOR cursor = LoadCursor(0, IDC_ARROW);
+            SetCursor(cursor);
+        } break;
+        case OS_CURSOR_CROSSHAIR: {
+            HCURSOR cursor = LoadCursor(0, IDC_CROSS);
+            SetCursor(cursor);
+        } break;
+        case OS_CURSOR_HAND: {
+            // HCURSOR cursor = LoadCursor(0, IDC_HAND);
+            HCURSOR cursor = LoadCursor(NULL, IDC_HAND);
+            SetCursor(cursor);
+        } break;
+        case OS_CURSOR_HELP: {
+            HCURSOR cursor = LoadCursor(0, IDC_HELP);
+            SetCursor(cursor);
+        } break;
+        case OS_CURSOR_IBEAM: {
+            HCURSOR cursor = LoadCursor(0, IDC_IBEAM);
+            SetCursor(cursor);
+        } break;
+        case OS_CURSOR_NOTALLOWED: {
+            HCURSOR cursor = LoadCursor(0, IDC_NO);
+            SetCursor(cursor);
+        } break;
+        case OS_CURSOR_RESIZE_ALL: {
+            HCURSOR cursor = LoadCursor(0, IDC_SIZEALL);
+            SetCursor(cursor);
+        } break;
+        case OS_CURSOR_RESIZE_NORTH_SOUTH: {
+            HCURSOR cursor = LoadCursor(0, IDC_SIZENS);
+            SetCursor(cursor);
+        } break;
+        case OS_CURSOR_RESIZE_NORTHEAST_SOUTHWEST: {
+            HCURSOR cursor = LoadCursor(0, IDC_SIZENESW);
+            SetCursor(cursor);
+        } break;
+        case OS_CURSOR_RESIZE_NORTHWEST_SOUTHEAST: {
+            HCURSOR cursor = LoadCursor(0, IDC_SIZENWSE);
+            SetCursor(cursor);
+        } break;
+        case OS_CURSOR_RESIZE_WEST_EAST: {
+            HCURSOR cursor = LoadCursor(0, IDC_SIZEWE);
+            SetCursor(cursor);
+        } break;
+        case OS_CURSOR_UP_ARROW: {
+            HCURSOR cursor = LoadCursor(0, IDC_UPARROW);
+            SetCursor(cursor);
+        } break;
+        case OS_CURSOR_HOURGLASS: {
+            HCURSOR cursor = LoadCursor(0, IDC_WAIT);
+            SetCursor(cursor);
+        } break;
+    }
+}
 
+OSLibrary assetsLib;
+Mem_alloc_func Asset;
+Mem_alloc_func MEM_ALLOC_PTR;
+Mem_calloc_func MEM_CALLOC_PTR;
+Mem_free_func MEM_FREE_PTR;
+Mem_resize_func MEM_RESIZE_PTR;
+Mem_log_func MEM_LOG_PTR;
+void (*Assets_initFunc)();
+void *(*Assets_getFunc)(const char *assetName);
+void (*Assets_putFunc)(const char *assetName, void *data);
+U32 (*Assets_hasFunc)(const char *assetName);
+
+void *Assets_get(const char *assetName) {
+    printf("Checking for asset: %s\n", assetName);
+    return Assets_getFunc(assetName);
+}
+
+void Assets_put(const char *assetName, void *data) {
+    printf("Adding asset: %s\n", assetName);
+    Assets_putFunc(assetName, data);
+}
+
+U32 Assets_has(const char *assetName) {
+    U32 has = Assets_hasFunc(assetName);
+    printf("Checking for asset: %s (exists: %s)\n", assetName, has ? "true" : "false");
+    return has;
+}
+
+/**
+ * @brief Assets has allocation functions that are used by the engine. Thus we have to bootstrap it
+ * 
+ */
 void OS_init() {
-    #if MEMTRACE
-    initMem();
-    #endif
+    assetsLib = malloc(sizeof(*assetsLib));
+    assetsLib->module = LoadLibraryA("assets.dll");
+    assetsLib->filename = "assets.dll";
+    assert(assetsLib->module);
+    Assets_initFunc = OS_LibraryFunction(assetsLib, "ASSET_SETUP");
+    Assets_getFunc = OS_LibraryFunction(assetsLib, "ASSET_GET");
+    Assets_putFunc = OS_LibraryFunction(assetsLib, "ASSET_PUT");
+    Assets_hasFunc = OS_LibraryFunction(assetsLib, "ASSET_HAS");
+    MEM_ALLOC_PTR = (Mem_alloc_func)OS_LibraryFunction(assetsLib, "Mem_alloc");
+    MEM_CALLOC_PTR = (Mem_calloc_func)OS_LibraryFunction(assetsLib, "Mem_calloc");
+    MEM_FREE_PTR = (Mem_free_func)OS_LibraryFunction(assetsLib, "Mem_free");
+    MEM_RESIZE_PTR = (Mem_resize_func)OS_LibraryFunction(assetsLib, "Mem_resize");
+    MEM_LOG_PTR = (Mem_log_func)OS_LibraryFunction(assetsLib, "logMem");
+
+#if EVENTLOGGING
+    OS_EVENT_LOG = fopen("event.log", "w");
+    char *header = "Time,Phase,System,Category,Event";
+    fwrite(header, 1, strlen(header), OS_EVENT_LOG);
+    OS_EVENTLOGGING = 1;
+    OS_EVENTLOGGING_KEYBOARD = 1;
+    OS_EVENTLOGGING_MOUSE = 1;
+    QueryPerformanceFrequency(&OS_EVENT_LOG_FREQUENCY);
+    QueryPerformanceCounter(&OS_EVENT_LOG_START_TIME);
+    OS_EventLog_startPhase("Beginning");
+#endif
+
+    Assets_initFunc();
+}
+
+#if EVENTLOGGING
+
+void OS_EventLog_startPhase(const char *phase) {
+    if (OS_EVENTLOGGING) {
+        memcpy(OS_EVENT_LOG_PHASE, phase, strlen(phase)+1);
+    }
+}
+
+void OS_logEvent(const char *system, const char *category, const char *event) {
+    if (OS_EVENTLOGGING) {
+        LARGE_INTEGER CurrentTime;
+        QueryPerformanceCounter(&CurrentTime);
+        CurrentTime.QuadPart = CurrentTime.QuadPart - OS_EVENT_LOG_START_TIME.QuadPart;
+        CurrentTime.QuadPart *= 1000000;
+        CurrentTime.QuadPart /= OS_EVENT_LOG_FREQUENCY.QuadPart;
+        double elapsedTimeInSeconds = (double)CurrentTime.QuadPart / 1000000.0;
+        fprintf(OS_EVENT_LOG, "\n%f,%s,%s,%s,\"%s\"", elapsedTimeInSeconds, OS_EVENT_LOG_PHASE, system, category, event);
+        fflush(OS_EVENT_LOG); //Performance?
+    }
+}
+#endif
+
+
+// struct IO_PrintHandler {
+//     char token[256];
+//     U64 hash;
+//     void (*func)(const void *type, char *output);
+// } IO_PrintHandlers[256] = {0};
+
+// void IO_PrintHandler_new(const char *token, void (*func)(const void *type, char *output)) {
+//     for (int i = 0; i < 256; i++) {
+//         if (!IO_PrintHandlers[i].func) {
+//             memcpy(IO_PrintHandlers[i].token, token, strlen(token)+1);
+//             IO_PrintHandlers[i].func = func;
+//             return;
+//         }
+//     }
+//     assert(0);
+// }
+
+// void IO_print(char *string, ...) {
+//     HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+//     DWORD written = 0;
+//     char buffer[4096];
+//     char *firstPos = buffer, *readptr = string, *writeptr = buffer; // Plan: Use math figure out how many characters were written
+//     va_list args;
+//     va_start(args, string);
+    
+//     while (readptr && *readptr) {
+//         if (*readptr != '{') {
+//             *writeptr++ = *readptr++;
+//             continue;
+//         }
+//         readptr++;
+//         if (*readptr == '{') {
+//             *writeptr++ = *readptr++;
+//             continue;
+//         }
+//         U64 hash = 0;
+//         while (*readptr && *readptr != '}') {
+//             hash = RollingHashString(*readptr, hash);
+//         }
+//         for (int i = 0; i < 256; i++) {
+//             if (IO_PrintHandlers[i].func && IO_PrintHandlers[i].hash == hash) {
+//                 IO_PrintHandlers[i].func(va_arg(args, void*), writeptr);
+//                 writeptr += strlen(writeptr);
+//                 break;
+//             }
+//         }  
+//     }
+
+//     WriteFile(out, string, strlen(string), &written, 0);
+// }
+
+void OS_initFromAssets(
+    Mem_alloc_func allocFunc,
+    Mem_calloc_func callocFunc,
+    Mem_free_func freeFunc,
+    Mem_resize_func resizeFunc,
+    Mem_log_func logFunc
+) {
+    MEM_ALLOC_PTR = allocFunc;
+    MEM_CALLOC_PTR = callocFunc;
+    MEM_FREE_PTR = freeFunc;
+    MEM_RESIZE_PTR = resizeFunc;
+    MEM_LOG_PTR = logFunc;
 }
 
 void OS_cleanup() {
-    #if MEMTRACE
-    closeMem();
-    #endif
+
 }
 
 #endif

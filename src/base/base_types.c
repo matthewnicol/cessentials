@@ -1,7 +1,23 @@
 #include <stdio.h>
 #include "base.h"
+#include "base/base/base.h"
 
 #define BUFFER_EXPAND 200
+
+const float EPSILON = 0.0000001f;
+const float VEC3_EPSILON = 0.000001f;
+// const float VEC3_EPSILON = 0.1f;
+// const float VEC3_EPSILON = 0.1f;
+const float MAT4_EPSILON = 0.000001f;
+const float QUAT_EPSILON = 0.000001f;
+
+
+
+const Vec3_t V3010 = {.x=0, .y=1, .z=0};
+const Vec3_t V3100 = {.x=1, .y=0, .z=0};
+const Vec3_t V3001 = {.x=0, .y=0, .z=1};
+const Vec3_t V3111 = {.x=1, .y=1, .z=1};
+const Vec3_t V3N111 = {.x=-1, .y=-1, .z=-1};
 
 List_t *List_build(char *file, int line, void *x, ...) {
     va_list ap;
@@ -132,7 +148,7 @@ int List_size(List_t *list) {
 Buffer_t *Buffer_new(size_t bytes_per_item, size_t capacity) {
     Buffer_t *buffer;
     NEW(buffer);
-    buffer->buffer = Mem_alloc(bytes_per_item*capacity, __FILE__, __LINE__);
+    buffer->buffer = MEM_ALLOC_PTR(bytes_per_item*capacity, __FILE__, __LINE__);
     if (!buffer->buffer) {
         FREE(buffer);
         return NULL;
@@ -163,6 +179,7 @@ int Buffer_write(Buffer_t *buffer, size_t n_items, const void *data) {
     }
     if (to_expand) {
         if (!Buffer_expand(buffer, to_expand)) {
+            assert(0);
             return -1;
         }
     }
@@ -205,9 +222,6 @@ int Buffer_consume(Buffer_t *buffer, Buffer_t **other, int destroyOther) {
     if (other && *other) {
         assert(buffer->bytes_per_item == (*other)->bytes_per_item);
         Buffer_write(buffer, (*other)->stored, (*other)->buffer);
-        // for (int i = 0; i < (*other)->stored; i++) {
-        //     Buffer_write(buffer, (*other)->stored, (*other)->buffer);
-        // }
         if (destroyOther) {
             FREE((*other)->buffer);
             FREE(*other);
@@ -283,7 +297,9 @@ ItemID Registry_register(IDRegistry *registry, void *item) {
 }
 
 void *Registry_get(IDRegistry *registry, ItemID item) {
-    return registry->items[item];
+    if (item < registry->maxItems)
+        return registry->items[item];
+    return 0;
 }
 
 void Registry_remove(IDRegistry *registry, ItemID item, int destroy) {
@@ -338,18 +354,9 @@ HashMap_t *HashMap_newInt_hop(char *file, int line) {
     return map;
 }
 
-size_t HashMap_hash(const char *key) {
-    size_t hash = 5381;
-    int c;
-    while ((c = *key++)) {
-        hash = ((hash << 5) + hash) + c;
-    }
-    return hash;
-}
-
 void HashMap_setInt(HashMap_t *map, const char *key, int payload) {
     assert(map->intMap);
-    int hash = (int)(HashMap_hash(key) % 1024);
+    int hash = (int)(HashString(key) % 1024);
     for (List_t *l = map->map[hash]; l; l = l->next) {
         char *testKey = l->payload;
         if (strcmp(testKey, key) == 0) {
@@ -362,10 +369,11 @@ void HashMap_setInt(HashMap_t *map, const char *key, int payload) {
 
 void HashMap_set(HashMap_t *map, const char *key, void *payload) {
     assert(!map->intMap);
-    int hash = (int)(HashMap_hash(key) % 1024);
+    int hash = (int)(HashString(key) % 1024);
     for (List_t *l = map->map[hash]; l; l = l->next) {
         Mapping_t *mapping = (Mapping_t*)l->payload;
         if (strcmp(mapping->key, key) == 0) {
+            //TODO: Memory leak on overwrite???
             mapping->value = payload;
             return;
         }
@@ -375,7 +383,7 @@ void HashMap_set(HashMap_t *map, const char *key, void *payload) {
 
 void *HashMap_pop(HashMap_t *map, const char *key) {
     assert(!map->intMap);
-    int hash = (int)(HashMap_hash(key) % 1024);
+    int hash = (int)(HashString(key) % 1024);
     List_t **l = &map->map[hash];
     while (*l) {
         Mapping_t *mapping = (*l)->payload;
@@ -390,7 +398,7 @@ void *HashMap_pop(HashMap_t *map, const char *key) {
 
 int HashMap_popInt(HashMap_t *map, const char *key) {
     assert(map->intMap);
-    int hash = (int)(HashMap_hash(key) % 1024);
+    int hash = (int)(HashString(key) % 1024);
     List_t **l = &map->map[hash];
     while (*l) {
         char *testKey = (*l)->payload;
@@ -405,7 +413,7 @@ int HashMap_popInt(HashMap_t *map, const char *key) {
 
 int HashMap_getInt(HashMap_t *map, const char *key) {
     assert(map->intMap);
-    int hash = (int)(HashMap_hash(key) % 1024);
+    int hash = (int)(HashString(key) % 1024);
     for (List_t *l = map->map[hash]; l; l = l->next) {
         char *testKey = l->payload;
         if (strcmp(key, testKey) == 0) {
@@ -417,7 +425,7 @@ int HashMap_getInt(HashMap_t *map, const char *key) {
 
 void *HashMap_get(HashMap_t *map, const char *key) {
     assert(!map->intMap);
-    int hash = (int)(HashMap_hash(key) % 1024);
+    int hash = (int)(HashString(key) % 1024);
     for (List_t *l = map->map[hash]; l; l = l->next) {
         Mapping_t *mapping = l->payload;
         if (strcmp(key, mapping->key) == 0) {
@@ -437,25 +445,360 @@ void HashMap_dispose(HashMap_t **map) {
     *map = 0;
 }
 
-// typedef struct StringDescriptor {
-//     size_t numChars;
-//     size_t spaceReserved;
-//     char *characters;
-// } StringDescriptor;
+struct Stack_t {
+    struct Stack_t *prev;
+    void *payload;
+    int height;
+};
 
-// StringDescriptor *StringDescriptor_new(size_t space) {
-//     StringDescriptor *d;
-//     NEW(d);
-//     d->numChars = 0;
-//     d->spaceReserved = space;
-//     NEWN(d->characters, space);
-//     return d;
-// }
+struct Stack_t nullStack = {0, 0};
 
-// size_t String_size(String string) {
-//     return *((size_t*)string)-2;
-// }
-// String String_consume(String *string, String other);
-// String String_copy(const String string);
-// String String_new(const char *strIn);
-// void String_dump(const String string);
+Stack_t Stack_new(void *top) {
+    if (!top) {
+        return &nullStack;
+    }
+    
+    Stack_t stack;
+    NEW(stack);
+    stack->prev = &nullStack;
+    stack->payload = top;
+    stack->height = 1;
+    return stack;
+}
+void *Stack_pop(Stack_t *stack) {
+    Stack_t top = *stack;
+    if (top == &nullStack) {
+        return 0;
+    }
+    *stack = top->prev;
+    void *data = top->payload;
+    FREE(top);
+    return data;
+}
+
+void Stack_push(Stack_t *stack, void *element) {
+    Stack_t top;
+    NEW(top);
+    top->prev = *stack;    
+    top->height = top->prev->height + 1;
+    top->payload = element;
+    *stack = top;
+}
+
+int Stack_size(Stack_t stack) {
+    return stack->height;
+    // if (stack == &nullStack) {
+    //     return stack->height;
+    // }
+    // return 0;
+}
+
+int Stack_empty(Stack_t stack) {
+    return !stack || stack == &nullStack;
+}
+
+void *Stack_top(Stack_t stack) {
+    if (!stack || stack == &nullStack) {
+        return 0;
+    }
+    return stack->payload;
+}
+
+int strpos(char *haystack, char *needle) {
+    char *p = haystack;
+    int i = 0;
+    while (*(p + i) != '\0') {
+        if (strncmp(p+i, needle, strlen(needle)) == 0) {
+            return i;
+        }
+        i++;
+    }
+    return -1;
+}
+
+struct MemHashMap_t {
+    List_t *map[1024];
+};
+
+MemHashMap_t *MemHashMap_new() {
+    MemHashMap_t *map;
+    NEW(map);
+    for (int i = 0; i < 1024; i++) {
+        map->map[i] = 0;
+    }
+    return map;
+}
+
+U64 MemHashMap_hash(void *key) {
+    U32 keylen = sizeof(key);
+    size_t hash = 5381;
+    char *kkey = key;
+    for (U32 i = 0; i < keylen; i++) 
+        hash = ((hash << 5) + hash) + kkey[i];
+    return hash;
+}
+
+void MemHashMap_set(MemHashMap_t *map, void *key, void *payload) {
+    int hash = (int)(HashString(key) % 1024);
+    for (List_t *l = map->map[hash]; l; l = l->next) {
+        MemHashMap_Mapping_t *mapping = l->payload;
+        if (memcmp(mapping->key, key, min(sizeof(mapping->key), sizeof(key))) == 0) {
+            //TODO: Memory leak on overwrite???
+            mapping->value = payload;
+            return;
+        }
+    }
+    MemHashMap_Mapping_t *mapping;
+    NEW(mapping);
+    mapping->key = key;
+    mapping->value = payload;
+    map->map[hash] = List_append(map->map[hash], mapping, 0);
+}
+
+void *MemHashMap_pop(MemHashMap_t *map, void *key) {
+    int hash = (int)(MemHashMap_hash(key) % 1024);
+    List_t **l = &map->map[hash];
+    while (*l) {
+        MemHashMap_Mapping_t *mapping = (*l)->payload;
+        if (memcmp(mapping->key, key, min(sizeof(mapping->key), sizeof(key))) == 0) {
+            void *payload = mapping->value;
+            *l = (*l)->next;
+            // TODO: MEMORY LEAK???
+            return payload;
+        }
+    }
+    return 0;
+}
+
+void *MemHashMap_get(MemHashMap_t *map, void *key) {
+    int hash = (int)(MemHashMap_hash(key) % 1024);
+    for (List_t *l = map->map[hash]; l; l = l->next) {
+        MemHashMap_Mapping_t *mapping = l->payload;
+        if (memcmp(mapping->key, key, min(sizeof(mapping->key), sizeof(key))) == 0) {
+            return mapping->value;
+        }
+    }
+    return 0;
+}
+
+typedef struct BSTNodeMapping_t {
+    unsigned long hash;
+    List_t *map;
+} BSTNodeMapping_t;
+
+typedef struct BSTNode_t {
+    BSTNodeMapping_t mapping;
+    int height;
+    struct BSTNode_t* left;
+    struct BSTNode_t* right;
+} BSTNode_t;
+
+typedef struct BST_t {
+    BSTNode_t *root;
+} BST_t;
+
+unsigned long BSTNode_hash(const char *key) {
+    size_t hash = 5381;
+    int c;
+    while ((c = *key++)) {
+        hash = ((hash << 5) + hash) + c;
+    }
+    return hash;
+}
+
+int BSTNode_height(BSTNode_t* node) {
+    if (node == NULL) {
+        return 0;
+    }
+    return node->height;
+}
+
+BSTNode_t* BSTNode_rightRotate(BSTNode_t* y) {
+    BSTNode_t* x = y->left;
+    BSTNode_t* T2 = x->right;
+    x->right = y;
+    y->left = T2;
+    y->height = max(BSTNode_height(y->left), BSTNode_height(y->right)) + 1;
+    x->height = max(BSTNode_height(x->left), BSTNode_height(x->right)) + 1;
+    return x;
+}
+
+BSTNode_t* BSTNode_leftRotate(BSTNode_t* x) {
+    BSTNode_t* y = x->right;
+    BSTNode_t* T2 = y->left;
+    y->left = x;
+    x->right = T2;
+    x->height = max(BSTNode_height(x->left), BSTNode_height(x->right)) + 1;
+    y->height = max(BSTNode_height(y->left), BSTNode_height(y->right)) + 1;
+    return y;
+}
+
+int BSTNode_findBalance(BSTNode_t* node) {
+    if (node == NULL) {
+        return 0;
+    }
+    return BSTNode_height(node->left) - BSTNode_height(node->right);
+}
+
+BSTNode_t* BSTNode_insert(BSTNode_t* node, const char *key, void *value) {
+    if (node == NULL) {
+        NEW(node);
+        Mapping_t *mapping;
+        NEW(mapping);
+        node->mapping.hash = BSTNode_hash(key);
+        node->mapping.map = List_list(mapping, 0);
+        mapping->key = copyString(key);
+        mapping->value = value;
+        node->height = 1;
+        node->left = 0;
+        node->right = 0;
+        return node;
+    }
+    unsigned long hashTest = BSTNode_hash(key);
+    if (hashTest < node->mapping.hash) {
+        node->left = BSTNode_insert(node->left, key, value);
+    } else if (hashTest > node->mapping.hash) {
+        node->right = BSTNode_insert(node->right, key, value);
+    } else {
+        for (List_t *lp = node->mapping.map; lp; lp = lp->next) {
+            Mapping_t *mapping = lp->payload;
+            if (strcmp(mapping->key, key) == 0) {
+                mapping->value = value;
+                return node;
+            }
+        }
+        Mapping_t *dupe;
+        NEW(dupe);
+        dupe->key = copyString(key);
+        dupe->value = value;
+        return node;
+    }
+    node->height = 1 + max(BSTNode_height(node->left), BSTNode_height(node->right));
+    int balance = BSTNode_findBalance(node);
+    if (balance > 1 && hashTest < node->left->mapping.hash) {
+        return BSTNode_rightRotate(node);
+    }
+    if (balance < -1 && hashTest > node->right->mapping.hash) {
+        return BSTNode_leftRotate(node);
+    }
+    if (balance > 1 && hashTest > node->left->mapping.hash) {
+        node->left = BSTNode_leftRotate(node->left);
+        return BSTNode_rightRotate(node);
+    }
+    if (balance < -1 && hashTest < node->right->mapping.hash) {
+        node->right = BSTNode_rightRotate(node->right);
+        return BSTNode_leftRotate(node);
+    }
+    return node;
+}
+
+BSTNode_t* BSTNode_minimumValue(BSTNode_t* node) {
+    BSTNode_t* current = node;
+    while (current->left != NULL) {
+        current = current->left;
+    }
+    return current;
+}
+
+BSTNode_t* BSTNode_remove(BSTNode_t* node, const char *key) {
+    if (node == NULL) {
+        return node;
+    }
+    unsigned long hashTest = BSTNode_hash(key);
+    if (hashTest < node->mapping.hash) {
+        node->left = BSTNode_remove(node->left, key);
+    } else if (hashTest > node->mapping.hash) {
+        node->right = BSTNode_remove(node->right, key);
+    }
+    else {
+        if (node->left == NULL || node->right == NULL) {
+            BSTNode_t* temp = node->left ? node->left : node->right;
+            if (temp == NULL) {
+                temp = node;
+                node = NULL;
+            } else {
+                *node = *temp;
+            }
+            // DOES NOT ACCOUNT FOR COLLISIONS...
+            FREE(temp->mapping.map);
+            FREE(temp);
+        } else {
+            BSTNode_t* temp = BSTNode_minimumValue(node->right);
+            node->mapping = temp->mapping;
+            Mapping_t *mapping = temp->mapping.map->payload;
+            node->right = BSTNode_remove(node->right, mapping->key);
+        }
+    }
+    if (node == NULL) {
+        return node;
+    }
+    node->height = 1 + max(BSTNode_height(node->left), BSTNode_height(node->right));
+    int balance = BSTNode_findBalance(node);
+    if (balance > 1 && BSTNode_findBalance(node->left) >= 0) {
+        return BSTNode_rightRotate(node);
+    }
+    if (balance > 1 && BSTNode_findBalance(node->left) < 0) {
+        node->left = BSTNode_leftRotate(node->left);
+        return BSTNode_rightRotate(node);
+    }
+    if (balance < -1 && BSTNode_findBalance(node->right) <= 0) {
+        return BSTNode_leftRotate(node);
+    }
+    if (balance < -1 && BSTNode_findBalance(node->right) > 0) {
+        node->right = BSTNode_rightRotate(node->right);
+        return BSTNode_leftRotate(node);
+    }
+    return node;
+}
+
+BSTNode_t* BSTNode_get(BSTNode_t* node, const char *key) {
+    if (node == NULL) {
+        return NULL;
+    }
+    unsigned long hashTest = BSTNode_hash(key);
+    if (hashTest == node->mapping.hash) {
+        return node;
+    }
+    if (hashTest < node->mapping.hash) {
+        return BSTNode_get(node->left, key);
+    }
+    return BSTNode_get(node->right, key);
+}
+
+BST_t *BST_new() {
+    BST_t *bst;
+    NEW(bst);
+    bst->root = 0;
+    return bst;
+}
+
+void BST_insert(BST_t *bst, const char *key, void *value) {
+    bst->root = BSTNode_insert(bst->root, key, value);
+}
+
+void *BST_get(BST_t *bst, const char *key) {
+    BSTNode_t *node = BSTNode_get(bst->root, key);
+    if (node) {
+        for (List_t *lp = node->mapping.map; lp; lp = lp->next) {
+            Mapping_t *mapping = lp->payload;
+            if (strcmp(mapping->key, key) == 0) {
+                return mapping->value;
+            }
+        }
+    }
+    return 0;
+}
+
+void BSTNode_applyInOrder(BSTNode_t *node, BST_applyFunc applyFunc, void **customData) {
+    if (node == 0) return;
+    BSTNode_applyInOrder(node->left, applyFunc, customData);
+    for (List_t *lp = node->mapping.map; lp; lp = lp->next) {
+        Mapping_t *mapping = lp->payload;
+        applyFunc(mapping->key, mapping->value, customData);
+    }
+    BSTNode_applyInOrder(node->right, applyFunc, customData);
+}
+
+void BST_apply(BST_t *bst, BST_applyFunc applyFunc, void *customData) {
+    BSTNode_applyInOrder(bst->root, applyFunc, &customData);
+}

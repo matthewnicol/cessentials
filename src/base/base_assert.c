@@ -9,11 +9,13 @@ void (assert)(int e) {
 }
 
 void _assert_with_message(int e, char *file, int line, char *format, ...) {
-    char buffer[1024];
-    va_list args;
-    va_start(args, format);
-    vsnprintf(buffer, 1024, format, args);
-    const Except_T failure = {buffer};
-    Except_raise(&failure, file, line);
-    va_end(args);
+    if (!e) {
+        char buffer[1024];
+        va_list args;
+        va_start(args, format);
+        vsnprintf(buffer, 1024, format, args);
+        const Except_T failure = {buffer};
+        Except_raise(&failure, file, line);
+        va_end(args);
+    }
 }
